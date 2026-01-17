@@ -503,6 +503,8 @@ class WanTransformerBlock_VSA(nn.Module):
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
+        attention_type = None, # not used
+        sla_topk = None, # not used
     ):
         super().__init__()
 
