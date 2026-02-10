@@ -142,6 +142,19 @@ class AttentionImpl(ABC, Generic[T]):
         """
         return qkv
 
+    def preprocess_qkv_before_all_to_all(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_metadata: T
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Preprocess QKV tensor before all_to_all for distributed attention.
+
+        Default implementation returns the tensor unchanged.
+        Subclasses can override this to implement custom preprocessing
+        like head reordering for load balancing.
+
+        Called BEFORE all_to_all for distributed attention
+        """
+        return q, k, v
+
     def postprocess_output(
         self,
         output: torch.Tensor,
@@ -155,6 +168,22 @@ class AttentionImpl(ABC, Generic[T]):
 
         Called BEFORE all_to_all for distributed attention
 
+        """
+
+        return output
+
+    def postprocess_output_after_all_to_all(
+        self,
+        output: torch.Tensor,
+        attn_metadata: T,
+    ) -> torch.Tensor:
+        """Postprocess the output tensor after all_to_all for distributed attention.
+
+        Default implementation returns the tensor unchanged.
+        Subclasses can override this to implement custom postprocessing
+        like restoring head order.
+
+        Called AFTER all_to_all for distributed attention
         """
 
         return output

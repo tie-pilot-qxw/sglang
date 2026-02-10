@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    LoadBalancingUlyssesAttention,
     LocalAttention,
     UlyssesAttention,
     UlyssesAttention_VSA,
@@ -18,6 +19,7 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import MinimalA2
 
 __all__ = [
     "USPAttention",
+    "LoadBalancingUlyssesAttention",
     "LocalAttention",
     "UlyssesAttention",
     "UlyssesAttention_VSA",

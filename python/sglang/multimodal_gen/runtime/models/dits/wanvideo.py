@@ -2,10 +2,14 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import math
+import os
+from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
@@ -16,6 +20,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
+    LoadBalancingUlyssesAttention,
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
     USPAttention,
@@ -54,6 +59,201 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_WAN_PROFILE_CFG_LOADED = False
+_WAN_PROFILE_TIMESTEPS: set[int] | None = None
+_WAN_PROFILE_LAYERS: set[int] | None = None
+_WAN_FORCE_PROFILE_DIR: str | None = None
+_WAN_FORCE_PROFILE_RANK: int | None = None
+_WAN_FORCE_PROFILE_LAYER: int | None = None
+_WAN_FORCE_PROFILER: torch.profiler.profile | None = None
+
+
+def _parse_int_spec(spec: str) -> set[int] | None:
+    spec = spec.strip()
+    if not spec:
+        return set()
+    if spec.lower() in ("*", "all"):
+        return None
+    values: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            try:
+                start = int(start_s.strip())
+                end = int(end_s.strip())
+            except ValueError:
+                continue
+            if end < start:
+                start, end = end, start
+            values.update(range(start, end + 1))
+        else:
+            try:
+                values.add(int(part))
+            except ValueError:
+                continue
+    return values
+
+
+def _load_wan_profile_cfg() -> None:
+    global _WAN_PROFILE_CFG_LOADED, _WAN_PROFILE_TIMESTEPS, _WAN_PROFILE_LAYERS
+    global _WAN_FORCE_PROFILE_DIR, _WAN_FORCE_PROFILE_RANK, _WAN_FORCE_PROFILE_LAYER
+    if _WAN_PROFILE_CFG_LOADED:
+        return
+    _WAN_PROFILE_CFG_LOADED = True
+    ts_spec = os.getenv("SGLANG_WAN_PROFILE_TIMESTEPS", "")
+    layer_spec = os.getenv("SGLANG_WAN_PROFILE_LAYERS", "")
+    _WAN_PROFILE_TIMESTEPS = _parse_int_spec(ts_spec)
+    _WAN_PROFILE_LAYERS = _parse_int_spec(layer_spec)
+    _WAN_FORCE_PROFILE_DIR = os.getenv("SGLANG_WAN_FORCE_PROFILE_DIR")
+    rank_spec = os.getenv("SGLANG_WAN_FORCE_PROFILE_RANK", "*")
+    layer_spec = os.getenv("SGLANG_WAN_FORCE_PROFILE_LAYER", "5")
+    try:
+        if rank_spec.strip().lower() in ("*", "all"):
+            _WAN_FORCE_PROFILE_RANK = None
+        else:
+            _WAN_FORCE_PROFILE_RANK = int(rank_spec)
+    except ValueError:
+        _WAN_FORCE_PROFILE_RANK = None
+    try:
+        _WAN_FORCE_PROFILE_LAYER = int(layer_spec)
+    except ValueError:
+        _WAN_FORCE_PROFILE_LAYER = 1
+    if not _WAN_FORCE_PROFILE_DIR:
+        _WAN_FORCE_PROFILE_DIR = "./log"
+
+
+def _wan_should_profile(timestep: int, layer_idx: int) -> bool:
+    _load_wan_profile_cfg()
+    if _WAN_PROFILE_TIMESTEPS == set() and _WAN_PROFILE_LAYERS == set():
+        return False
+    if _WAN_PROFILE_TIMESTEPS is not None and timestep not in _WAN_PROFILE_TIMESTEPS:
+        return False
+    if _WAN_PROFILE_LAYERS is not None and layer_idx not in _WAN_PROFILE_LAYERS:
+        return False
+    return True
+
+
+def _profile_scope(enabled: bool, name: str):
+    if enabled:
+        return torch.profiler.record_function(name)
+    return nullcontext()
+
+
+def _get_profile_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def _wan_force_profile_enabled(timestep: int, rank: int) -> bool:
+    _load_wan_profile_cfg()
+    if not _WAN_FORCE_PROFILE_DIR:
+        return False
+    if _WAN_FORCE_PROFILE_RANK is not None and rank != _WAN_FORCE_PROFILE_RANK:
+        return False
+    if _WAN_PROFILE_TIMESTEPS is not None and timestep not in _WAN_PROFILE_TIMESTEPS:
+        return False
+    return True
+
+
+def _wan_force_profile_start() -> torch.profiler.profile:
+    global _WAN_FORCE_PROFILER
+    if _WAN_FORCE_PROFILER is not None:
+        return _WAN_FORCE_PROFILER
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    _WAN_FORCE_PROFILER = torch.profiler.profile(
+        activities=activities,
+        record_shapes=True,
+        with_stack=True,
+    )
+    _WAN_FORCE_PROFILER.start()
+    return _WAN_FORCE_PROFILER
+
+
+def _wan_maybe_merge_traces(trace_path: str, step_idx: int, lb_tag: str) -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    world_size = dist.get_world_size()
+    if world_size <= 1:
+        return
+    if _WAN_FORCE_PROFILE_DIR is None:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    with open(trace_path, "rb") as f:
+        content = f.read()
+    gathered = [None for _ in range(world_size)] if dist.get_rank() == 0 else None
+    dist.gather_object(content, gathered, dst=0)
+    dist.barrier()
+    if dist.get_rank() != 0:
+        return
+
+    merged_events: list[dict[str, Any]] = []
+    base_trace: dict[str, Any] | None = None
+    delta_stride = 100_000_000
+
+    def _map_value(x, delta):
+        if isinstance(x, str):
+            return f"{x}_{delta}"
+        return x + delta
+
+    for rank, payload in enumerate(gathered or []):
+        if payload is None:
+            continue
+        trace = json.loads(payload.decode("utf-8", errors="replace"))
+        if base_trace is None:
+            base_trace = trace
+        events = trace.get("traceEvents", [])
+        delta = rank * delta_stride
+        for item in events:
+            if "pid" in item:
+                item["pid"] = _map_value(item["pid"], delta)
+            if "tid" in item:
+                item["tid"] = _map_value(item["tid"], delta)
+        merged_events.extend(events)
+
+    if base_trace is None:
+        return
+    base_trace["traceEvents"] = merged_events
+    out_path = os.path.join(
+        _WAN_FORCE_PROFILE_DIR,
+        f"wan2.force.merged.s{step_idx}.{lb_tag}.trace.json",
+    )
+    with open(out_path, "w") as f:
+        json.dump(base_trace, f)
+    logger.info("Wan2 force profiler merged: step=%s path=%s", step_idx, out_path)
+
+
+def _wan_force_profile_stop(timestep: int, rank: int, lb_tag: str) -> None:
+    global _WAN_FORCE_PROFILER
+    if _WAN_FORCE_PROFILER is None:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _WAN_FORCE_PROFILER.step()
+    _WAN_FORCE_PROFILER.stop()
+    os.makedirs(_WAN_FORCE_PROFILE_DIR, exist_ok=True)  # type: ignore[arg-type]
+    trace_path = os.path.join(
+        _WAN_FORCE_PROFILE_DIR,  # type: ignore[arg-type]
+        f"wan2.force.r{rank}.s{timestep}.trace.json",
+    )
+    _WAN_FORCE_PROFILER.export_chrome_trace(trace_path)
+    logger.info(
+        "Wan2 force profiler saved: layer=%s step=%s path=%s",
+        _WAN_FORCE_PROFILE_LAYER,
+        timestep,
+        trace_path,
+    )
+    _wan_maybe_merge_traces(trace_path, timestep, lb_tag)
+    _WAN_FORCE_PROFILER = None
+
+
 _is_cuda = current_platform.is_cuda()
 
 
@@ -151,14 +351,28 @@ class WanSelfAttention(nn.Module):
         self.local_num_heads = divide(num_heads, tp_size)
 
         # Scaled dot product attention
-        self.attn = USPAttention(
-            num_heads=self.local_num_heads,
-            head_size=self.head_dim,
-            dropout_rate=0,
-            softmax_scale=None,
-            causal=False,
-            supported_attention_backends=supported_attention_backends,
-        )
+        if (
+            supported_attention_backends is not None
+            and AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
+            in supported_attention_backends
+        ):
+            self.attn = LoadBalancingUlyssesAttention(
+                num_heads=self.local_num_heads,
+                head_size=self.head_dim,
+                dropout_rate=0,
+                softmax_scale=None,
+                causal=False,
+                supported_attention_backends=supported_attention_backends,
+            )
+        else:
+            self.attn = USPAttention(
+                num_heads=self.local_num_heads,
+                head_size=self.head_dim,
+                dropout_rate=0,
+                softmax_scale=None,
+                causal=False,
+                supported_attention_backends=supported_attention_backends,
+            )
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, context_lens: int):
         r"""
@@ -331,13 +545,34 @@ class WanTransformerBlock(nn.Module):
                 },
             )
         else:
-            self.attn1 = USPAttention(
-                num_heads=self.local_num_heads,
-                head_size=dim // num_heads,
-                causal=False,
-                supported_attention_backends=self_attn_backends,
-                prefix=f"{prefix}.attn1",
+            from sglang.multimodal_gen.runtime.layers.attention.selector import (
+                get_attn_backend,
             )
+            from sglang.multimodal_gen.utils import get_compute_dtype
+
+            if (
+                get_attn_backend(
+                    dim // num_heads,
+                    get_compute_dtype(),
+                    supported_attention_backends=self_attn_backends,
+                )
+                == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
+            ):
+                self.attn1 = LoadBalancingUlyssesAttention(
+                    num_heads=self.local_num_heads,
+                    head_size=dim // num_heads,
+                    causal=False,
+                    supported_attention_backends=self_attn_backends,
+                    prefix=f"{prefix}.attn1",
+                )
+            else:
+                self.attn1 = USPAttention(
+                    num_heads=self.local_num_heads,
+                    head_size=dim // num_heads,
+                    causal=False,
+                    supported_attention_backends=self_attn_backends,
+                    prefix=f"{prefix}.attn1",
+                )
 
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
@@ -844,6 +1079,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             timestep = timestep.flatten()  # batch_size * seq_len
         else:
             ts_seq_len = None
+        ctx = get_forward_context()
+        profile_step = (
+            int(ctx.current_timestep) if ctx is not None else int(timestep[0].item())
+        )
+        profile_rank = _get_profile_rank()
+        force_profile = _wan_force_profile_enabled(profile_step, profile_rank)
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
@@ -886,10 +1127,33 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
-            for block in self.blocks:
-                hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
-                )
+            lb_tag = (
+                "lb1"
+                if os.getenv("SGLANG_SVG2_LOADBALANCE", "1").lower()
+                not in ("0", "false")
+                else "lb0"
+            )
+            for block_idx, block in enumerate(self.blocks):
+                if (
+                    force_profile
+                    and _WAN_FORCE_PROFILE_LAYER is not None
+                    and block_idx == _WAN_FORCE_PROFILE_LAYER
+                ):
+                    _wan_force_profile_start()
+                enabled = _wan_should_profile(profile_step, block_idx)
+                with _profile_scope(
+                    enabled,
+                    f"wan2.block.r{profile_rank}.s{profile_step}.l{block_idx}.{lb_tag}",
+                ):
+                    hidden_states = block(
+                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    )
+                if (
+                    force_profile
+                    and _WAN_FORCE_PROFILE_LAYER is not None
+                    and block_idx == _WAN_FORCE_PROFILE_LAYER
+                ):
+                    _wan_force_profile_stop(profile_step, profile_rank, lb_tag)
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)

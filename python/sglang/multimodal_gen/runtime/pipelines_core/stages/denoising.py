@@ -1228,7 +1228,7 @@ class DenoisingStage(PipelineStage):
                     Svg2Cache,
                 )
 
-                cache = Svg2Cache()
+                cache = Svg2Cache(planning_stream=torch.cuda.Stream())
                 batch.extra["svg2_cache"] = cache
 
             patch_size = server_args.pipeline_config.dit_config.patch_size

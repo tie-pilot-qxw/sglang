@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import os
 from typing import Type
 
 import torch
@@ -389,5 +390,89 @@ class USPAttention(nn.Module):
         if get_ulysses_parallel_world_size() > 1:
             # -> [B, S_local, H, D]
             out = _usp_output_all_to_all(out, head_dim=2)
+
+        return out
+
+
+class LoadBalancingUlyssesAttention(USPAttention):
+    """Ulysses attention with SVG2 load balancing enabled."""
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        num_kv_heads: int | None = None,
+        softmax_scale: float | None = None,
+        causal: bool = False,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        prefix: str = "",
+        dropout_rate: float = 0.0,
+        **extra_impl_args,
+    ) -> None:
+        super().__init__(
+            num_heads=num_heads,
+            head_size=head_size,
+            num_kv_heads=num_kv_heads,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            supported_attention_backends=supported_attention_backends,
+            prefix=prefix,
+            dropout_rate=dropout_rate,
+            **extra_impl_args,
+        )
+        if self.backend != AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
+            raise ValueError(
+                "LoadBalancingUlyssesAttention requires SPARSE_VIDEO_GEN_2_ATTN backend."
+            )
+        if get_ring_parallel_world_size() > 1:
+            raise ValueError(
+                "LoadBalancingUlyssesAttention does not support ring parallelism."
+            )
+        self.enable_loadbalancing = os.getenv(
+            "SGLANG_SVG2_LOADBALANCE", "1"
+        ).lower() not in ("0", "false")
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        replicated_q: torch.Tensor | None = None,
+        replicated_k: torch.Tensor | None = None,
+        replicated_v: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert (
+            replicated_q is None and replicated_k is None and replicated_v is None
+        ), "LoadBalancingUlyssesAttention does not support replicated_qkv."
+        forward_context: ForwardContext = get_forward_context()
+        ctx_attn_metadata = forward_context.attn_metadata
+        if get_ring_parallel_world_size() > 1:
+            raise RuntimeError(
+                "LoadBalancingUlyssesAttention does not support ring parallelism."
+            )
+        if get_sequence_parallel_world_size() == 1:
+            return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+
+        if get_ulysses_parallel_world_size() > 1:
+            did_reorder = False
+            if self.enable_loadbalancing and q.shape == k.shape == v.shape:
+                q, k, v = self.attn_impl.preprocess_qkv_before_all_to_all(
+                    q, k, v, ctx_attn_metadata
+                )
+                did_reorder = True
+            q = sequence_model_parallel_all_to_all_4D(q, scatter_dim=2, gather_dim=1)
+            k = sequence_model_parallel_all_to_all_4D(k, scatter_dim=2, gather_dim=1)
+            v = sequence_model_parallel_all_to_all_4D(v, scatter_dim=2, gather_dim=1)
+
+        out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+
+        if get_ulysses_parallel_world_size() > 1:
+            out = sequence_model_parallel_all_to_all_4D(
+                out, scatter_dim=1, gather_dim=2
+            )
+            if did_reorder:
+                out = self.attn_impl.postprocess_output_after_all_to_all(
+                    out, ctx_attn_metadata
+                )
 
         return out
