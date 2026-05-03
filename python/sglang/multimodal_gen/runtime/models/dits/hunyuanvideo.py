@@ -12,6 +12,7 @@ from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import (
+    LoadBalancingUlyssesAttention,
     LocalAttention,
     UlyssesAttention,
 )
@@ -144,8 +145,18 @@ class MMDoubleStreamBlock(nn.Module):
 
         self.txt_mlp = MLP(hidden_size, mlp_hidden_dim, bias=True, dtype=dtype)
 
-        # Use UlyssesAttention to replace Distributed attention
-        self.attn = UlyssesAttention(
+        # Use UlyssesAttention to replace Distributed attention; pick the
+        # load-balancing variant when SVG2 is one of the supported backends.
+        attn_cls = (
+            LoadBalancingUlyssesAttention
+            if (
+                supported_attention_backends is not None
+                and AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
+                in supported_attention_backends
+            )
+            else UlyssesAttention
+        )
+        self.attn = attn_cls(
             num_heads=num_attention_heads,
             head_size=head_dim,
             causal=False,
@@ -318,8 +329,18 @@ class MMSingleStreamBlock(nn.Module):
             prefix=f"{prefix}.modulation",
         )
 
-        # Use UlyssesAttention to replace Distributed attention
-        self.attn = UlyssesAttention(
+        # Use UlyssesAttention to replace Distributed attention; pick the
+        # load-balancing variant when SVG2 is one of the supported backends.
+        attn_cls = (
+            LoadBalancingUlyssesAttention
+            if (
+                supported_attention_backends is not None
+                and AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
+                in supported_attention_backends
+            )
+            else UlyssesAttention
+        )
+        self.attn = attn_cls(
             num_heads=num_attention_heads,
             head_size=head_dim,
             causal=False,

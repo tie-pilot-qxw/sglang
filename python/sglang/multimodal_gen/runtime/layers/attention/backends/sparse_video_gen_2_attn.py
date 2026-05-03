@@ -1116,7 +1116,10 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         k: torch.Tensor,
         v: torch.Tensor,
         attn_metadata: SparseVideoGen2AttentionMetadata,
-    ) -> torch.Tensor:
+        replicated_q: torch.Tensor | None = None,
+        replicated_k: torch.Tensor | None = None,
+        replicated_v: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Asymm a2a path: variable heads-per-rank LPT + symm-mem pull/push.
 
         Replaces the symm path's
@@ -1128,10 +1131,21 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         and skips the pre/post head permute (the kernel routes by h_idxs_r).
 
         Inputs are [B, S_local, H_total, D]; output matches.
+
+        replicated_q/k/v are full-head tensors replicated across all SP ranks
+        (Hunyuan's text/prompt tokens). When provided, each rank slices its
+        owned heads via h_idxs_r and concatenates onto the SP-sharded tokens
+        along the seq dim before attention; after attention the replicated
+        tail is split off, padded-all-gathered along H, and scattered back
+        to global head order using pos_of_head. Returns
+        (out, replicated_out) — replicated_out is None when no replicated
+        input was provided.
         """
+        has_replicated = replicated_q is not None
         world_size = get_sequence_parallel_world_size()
         if world_size == 1:
-            return self.forward(q, k, v, attn_metadata)
+            out = self.forward(q, k, v, attn_metadata)
+            return out, None
 
         # 1. Plan: which heads does this rank own this step? Falls back to
         # contiguous when sparse window not active OR when no density yet.
@@ -1191,8 +1205,70 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         q_loc = q_loc.transpose(1, 2).contiguous()
         k_loc = k_loc.transpose(1, 2).contiguous()
         v_loc = v_loc.transpose(1, 2).contiguous()
+
+        # If replicated qkv (Hunyuan text tokens) is present, slice to this
+        # rank's heads using h_idxs_r and concat onto the seq dim.
+        h_idxs_long = h_idxs_r.to(dtype=torch.long)
+        replicated_seq_len = 0
+        if has_replicated:
+            replicated_seq_len = replicated_q.shape[1]
+            rep_q_loc = replicated_q.index_select(2, h_idxs_long)
+            rep_k_loc = replicated_k.index_select(2, h_idxs_long)
+            rep_v_loc = replicated_v.index_select(2, h_idxs_long)
+            q_loc = torch.cat([q_loc, rep_q_loc], dim=1)
+            k_loc = torch.cat([k_loc, rep_k_loc], dim=1)
+            v_loc = torch.cat([v_loc, rep_v_loc], dim=1)
+
         out_loc = self.forward(q_loc, k_loc, v_loc, attn_metadata)
-        # out_loc: [B, S_total, H_local_r, D]
+        # out_loc: [B, S_total (+ S_txt), H_local_r, D]
+
+        # 5b. Split off replicated tail before pushing the SP-sharded portion.
+        replicated_out: torch.Tensor | None = None
+        if has_replicated and replicated_seq_len > 0:
+            rep_out_local = out_loc[:, s_total:, :, :].contiguous()
+            out_loc = out_loc[:, :s_total, :, :]
+            # Padded all_gather along H so variable heads_per_rank works.
+            max_hpr = max(heads_per_rank)
+            h_local = h_idxs_r.numel()
+            if h_local < max_hpr:
+                pad = rep_out_local.new_zeros(
+                    rep_out_local.shape[0],
+                    rep_out_local.shape[1],
+                    max_hpr - h_local,
+                    rep_out_local.shape[3],
+                )
+                rep_out_padded = torch.cat([rep_out_local, pad], dim=2).contiguous()
+            else:
+                rep_out_padded = rep_out_local.contiguous()
+            gathered = torch.empty(
+                (world_size,) + tuple(rep_out_padded.shape),
+                dtype=rep_out_padded.dtype,
+                device=rep_out_padded.device,
+            )
+            dist.all_gather_into_tensor(gathered, rep_out_padded, group=sp_group)
+            # gathered: [W, B, S_txt, max_hpr, D] → [B, S_txt, W * max_hpr, D]
+            gathered = gathered.permute(1, 2, 0, 3, 4).reshape(
+                rep_out_padded.shape[0],
+                replicated_seq_len,
+                world_size * max_hpr,
+                rep_out_padded.shape[3],
+            )
+            # Build pos_of_head[gh] = r * max_hpr + lh and scatter to global
+            # head order. heads_per_rank + h_idxs_r from each rank reconstruct
+            # the bins: rank r's bin starts at flat_perm[sum(hpr[:r])].
+            head_perm_cpu = layer_cache.head_perm.tolist()
+            pos_of_head_list = [0] * h_total
+            ofs2 = 0
+            for r in range(world_size):
+                hpr = heads_per_rank[r]
+                for lh in range(hpr):
+                    gh = head_perm_cpu[ofs2 + lh]
+                    pos_of_head_list[gh] = r * max_hpr + lh
+                ofs2 += hpr
+            pos_of_head = torch.tensor(
+                pos_of_head_list, device=q.device, dtype=torch.long
+            )
+            replicated_out = gathered.index_select(2, pos_of_head).contiguous()
 
         # 6. Push back: [B, H_local_r, S_total_padded, D] -> peers' recv_symm.
         out_h_first = out_loc.transpose(1, 2).contiguous()  # [B, H_local_r, S_total, D]
@@ -1225,4 +1301,4 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         if symm_a2a.s_local_padded != real_s:
             out_full = out_full[:, :, :real_s, :].contiguous()
         out = out_full.transpose(1, 2).contiguous()  # [B, S_local, H_total, D]
-        return out
+        return out, replicated_out

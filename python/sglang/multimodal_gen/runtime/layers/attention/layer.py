@@ -436,18 +436,38 @@ class LoadBalancingUlyssesAttention(USPAttention):
         replicated_q: torch.Tensor | None = None,
         replicated_k: torch.Tensor | None = None,
         replicated_v: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        assert (
-            replicated_q is None and replicated_k is None and replicated_v is None
-        ), "LoadBalancingUlyssesAttention does not support replicated_qkv."
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        """LB-aware ulysses forward.
+
+        Returns a single Tensor when called without replicated_qkv (matches
+        plain USPAttention; used by WAN), and a (out, replicated_out) tuple
+        when replicated_qkv is provided (matches UlyssesAttention; used by
+        Hunyuan double/single stream blocks).
+        """
+        has_replicated = replicated_q is not None
+        if has_replicated:
+            assert (
+                replicated_k is not None and replicated_v is not None
+            ), "replicated_q/k/v must be provided together"
+
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
+
         if get_ring_parallel_world_size() > 1:
             raise RuntimeError(
                 "LoadBalancingUlyssesAttention does not support ring parallelism."
             )
         if get_sequence_parallel_world_size() == 1:
-            return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            if has_replicated:
+                # No SP: still concat replicated to seq for joint attention.
+                seq_len = q.shape[1]
+                q = torch.cat([q, replicated_q], dim=1)
+                k = torch.cat([k, replicated_k], dim=1)
+                v = torch.cat([v, replicated_v], dim=1)
+                out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+                return out[:, :seq_len], out[:, seq_len:]
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            return out
 
         # Cross-attn (q ≠ k/v shape) always falls back to the plain symm path
         # — head LB only makes sense for self-attn where Q/K/V share H/S.
@@ -455,16 +475,28 @@ class LoadBalancingUlyssesAttention(USPAttention):
         if not (q.shape == k.shape == v.shape):
             lb_mode = "off"
 
-        if get_ulysses_parallel_world_size() > 1:
-            if lb_mode == "unequal_asymm":
-                # Asymm path: planning + all_to_all comm + inverse mapping all
-                # routed by h_idxs_r-indexed pull/push. Skips symm a2a and the
-                # pre/post head permute entirely.
-                return self.attn_impl.forward_distributed_asymm(
-                    q, k, v, ctx_attn_metadata
-                )
+        if lb_mode == "unequal_asymm" and get_ulysses_parallel_world_size() > 1:
+            # Asymm path: routing + replicated handling all done inside the
+            # impl (h_idxs_r-indexed pull/push, padded all_gather for
+            # replicated_out). Always returns a tuple — adapt to caller.
+            out, replicated_out = self.attn_impl.forward_distributed_asymm(
+                q,
+                k,
+                v,
+                ctx_attn_metadata,
+                replicated_q=replicated_q,
+                replicated_k=replicated_k,
+                replicated_v=replicated_v,
+            )
+            return (out, replicated_out) if has_replicated else out
 
-            did_reorder = False
+        # ---- mode="off" or "equal" via symm a2a path ----
+        local_rank = get_sp_parallel_rank()
+        world_size = get_sp_world_size()
+        seq_len = q.shape[1]
+
+        did_reorder = False
+        if get_ulysses_parallel_world_size() > 1:
             if lb_mode == "equal":
                 q, k, v = self.attn_impl.preprocess_qkv_before_all_to_all(
                     q, k, v, ctx_attn_metadata
@@ -474,9 +506,62 @@ class LoadBalancingUlyssesAttention(USPAttention):
             k = sequence_model_parallel_all_to_all_4D(k, scatter_dim=2, gather_dim=1)
             v = sequence_model_parallel_all_to_all_4D(v, scatter_dim=2, gather_dim=1)
 
+        if has_replicated:
+            num_heads_total = replicated_q.shape[2]
+            heads_per_rank = num_heads_total // world_size
+            if did_reorder:
+                # Heads on this rank are head_perm[r*hpr : (r+1)*hpr] of the
+                # original head dim; replicated_qkv has the original ordering,
+                # so index_select onto our slice.
+                layer_cache = ctx_attn_metadata.cache.get_layer(
+                    self.attn_impl.layer_idx
+                )
+                head_ids = layer_cache.head_perm[
+                    local_rank * heads_per_rank : (local_rank + 1) * heads_per_rank
+                ]
+                replicated_q_local = replicated_q.index_select(2, head_ids)
+                replicated_k_local = replicated_k.index_select(2, head_ids)
+                replicated_v_local = replicated_v.index_select(2, head_ids)
+            else:
+                replicated_q_local = replicated_q[
+                    :,
+                    :,
+                    local_rank * heads_per_rank : (local_rank + 1) * heads_per_rank,
+                ]
+                replicated_k_local = replicated_k[
+                    :,
+                    :,
+                    local_rank * heads_per_rank : (local_rank + 1) * heads_per_rank,
+                ]
+                replicated_v_local = replicated_v[
+                    :,
+                    :,
+                    local_rank * heads_per_rank : (local_rank + 1) * heads_per_rank,
+                ]
+            q = torch.cat([q, replicated_q_local], dim=1)
+            k = torch.cat([k, replicated_k_local], dim=1)
+            v = torch.cat([v, replicated_v_local], dim=1)
+
         out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
+        replicated_out = None
         if get_ulysses_parallel_world_size() > 1:
+            if has_replicated:
+                replicated_out = out[:, seq_len * world_size :]
+                out = out[:, : seq_len * world_size]
+                # Gather across SP along H to recover the full H_total.
+                replicated_out = sequence_model_parallel_all_gather(
+                    replicated_out.contiguous(), dim=2
+                )
+                if did_reorder:
+                    # Gathered concat order is exactly head_perm; permute back
+                    # to original head ids.
+                    layer_cache = ctx_attn_metadata.cache.get_layer(
+                        self.attn_impl.layer_idx
+                    )
+                    replicated_out = replicated_out.index_select(
+                        2, layer_cache.head_perm_inv
+                    )
             out = sequence_model_parallel_all_to_all_4D(
                 out, scatter_dim=1, gather_dim=2
             )
@@ -485,4 +570,4 @@ class LoadBalancingUlyssesAttention(USPAttention):
                     out, ctx_attn_metadata
                 )
 
-        return out
+        return (out, replicated_out) if has_replicated else out
