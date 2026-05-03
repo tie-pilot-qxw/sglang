@@ -1231,6 +1231,24 @@ class DenoisingStage(PipelineStage):
                 cache = Svg2Cache(planning_stream=torch.cuda.Stream())
                 batch.extra["svg2_cache"] = cache
 
+            # Load (or auto-profile) cost model once and stash on the cache.
+            cost_model_dict: dict | None = None
+            if (
+                server_args.svg2_load_balance != "off"
+                and server_args.svg2_cost_model_path is not None
+            ):
+                cost_model_dict = batch.extra.get("svg2_cost_model")
+                if cost_model_dict is None:
+                    from sglang.multimodal_gen.runtime.layers.attention.backends.svg2_cost_profiler import (
+                        load_or_profile_cost_model,
+                    )
+
+                    cost_model_dict = load_or_profile_cost_model(
+                        path=server_args.svg2_cost_model_path,
+                        dit_config=server_args.pipeline_config.dit_config,
+                    )
+                    batch.extra["svg2_cost_model"] = cost_model_dict
+
             patch_size = server_args.pipeline_config.dit_config.patch_size
             if isinstance(patch_size, list):
                 patch_size = tuple(patch_size)
@@ -1277,6 +1295,7 @@ class DenoisingStage(PipelineStage):
                 prompt_length=prompt_length,
                 cache=cache,
                 load_balance=server_args.svg2_load_balance,
+                cost_model=cost_model_dict,
                 calculate_density=False,  # only need density when doing head load balancing
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:

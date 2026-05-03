@@ -170,9 +170,40 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
     # "equal"         - LPT with equal heads/rank + symm a2a
     # "unequal_asymm" - LPT (variable heads/rank) + asymm pull/push
     load_balance: str = "off"
+    # Cost model dict (loaded from svg2_cost_model_path JSON) and the seq
+    # length used to weight per-head cost for LPT. seq_len_for_cost is the
+    # full single-card sequence length (not SP-sharded), i.e. the per-head
+    # work seen if a single rank held one head. Both None disables cost
+    # weighting (LPT falls back to raw density).
+    cost_model: dict | None = None
+    seq_len_for_cost: int | None = None
     prompt_length: int | None = None
     max_seqlen_q: int | None = None
     max_seqlen_k: int | None = None
+
+
+def _estimate_head_costs(
+    densities: list[float],
+    seq_len: int | None,
+    cost_model: dict | None,
+) -> list[float]:
+    """Map per-head density to predicted compute cost for LPT weighting.
+
+    cost_model is the JSON dict produced by svg2_cost_profiler, with keys
+    `mask_fit.slope_ms_per_unit` and `attention_fit.slope_ms_per_unit`. With
+    a model:
+        cost = mask_slope * S + attn_slope * density * S^2
+    so even low-density heads carry a fixed mask floor (`mask_slope * S`).
+
+    Falls back to raw density (passthrough) when cost_model or seq_len is
+    None — same behavior as bench's estimate_head_costs.
+    """
+    if cost_model is None or seq_len is None:
+        return [float(d) for d in densities]
+    mask_slope = float(cost_model["mask_fit"]["slope_ms_per_unit"])
+    attention_slope = float(cost_model["attention_fit"]["slope_ms_per_unit"])
+    s = float(seq_len)
+    return [mask_slope * s + attention_slope * float(d) * s * s for d in densities]
 
 
 def _even_heads_per_rank(num_heads: int, world_size: int) -> list[int]:
@@ -265,6 +296,8 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
         context_length: int = 0,
         prompt_length: int | None = None,
         load_balance: str = "off",
+        cost_model: dict | None = None,
+        seq_len_for_cost: int | None = None,
         **kwargs: dict[str, Any],
     ) -> SparseVideoGen2AttentionMetadata:
         raw_shape = tuple(raw_latent_shape)
@@ -285,6 +318,13 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
         num_frame = t // pt
         frame_size = (h // ph) * (w // pw)
 
+        # Single-card per-head full sequence length used for cost weighting.
+        # Matches what each head sees inside `forward()` once SP a2a has
+        # collected the full seq onto one rank: video tokens + replicated
+        # prompt tail. seq_len_for_cost passed in by the caller wins.
+        if seq_len_for_cost is None:
+            seq_len_for_cost = num_frame * frame_size + context_length
+
         return SparseVideoGen2AttentionMetadata(
             current_timestep=current_timestep,
             num_q_centroids=num_q_centroids,
@@ -302,6 +342,8 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
             frame_size=frame_size,
             cache=cache,
             load_balance=load_balance,
+            cost_model=cost_model,
+            seq_len_for_cost=seq_len_for_cost,
         )
 
 
@@ -352,6 +394,8 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         num_heads: int,
         world_size: int,
         mode: str,
+        cost_model: dict | None = None,
+        seq_len_for_cost: int | None = None,
     ) -> tuple[list[int], list[int]]:
         """Returns (flat_perm, heads_per_rank).
 
@@ -365,18 +409,22 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
           "unequal_asymm" - unequal LPT (variable heads_per_rank).
           "equal" / other - equal-cap LPT + local search; heads_per_rank
                             uniform = num_heads // world_size.
+
+        When cost_model + seq_len_for_cost are provided, raw density is
+        mapped through _estimate_head_costs so LPT weights heads by
+        predicted ms instead of bare density (corrects the fixed mask floor).
         """
         if density_cpu is None:
             return list(range(num_heads)), _even_heads_per_rank(num_heads, world_size)
 
-        if mode == "unequal_asymm":
-            return _lpt_assignment_unequal(
-                [float(density_cpu[i].item()) for i in range(num_heads)],
-                world_size,
-            )
+        densities = [float(density_cpu[i].item()) for i in range(num_heads)]
+        weights = _estimate_head_costs(densities, seq_len_for_cost, cost_model)
 
-        # weight: higher density => more work
-        w = [float(density_cpu[i].item()) for i in range(num_heads)]
+        if mode == "unequal_asymm":
+            return _lpt_assignment_unequal(weights, world_size)
+
+        # weight: higher cost => more work
+        w = list(weights)
 
         # LPT order
         sorted_heads = sorted(range(num_heads), key=lambda i: (-w[i], i))
@@ -542,7 +590,12 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         assert layer_cache.density is not None
 
         perm_list, heads_per_rank = self._compute_head_reorder_perm(
-            layer_cache.density, num_heads, world_size, attn_metadata.load_balance
+            layer_cache.density,
+            num_heads,
+            world_size,
+            attn_metadata.load_balance,
+            cost_model=attn_metadata.cost_model,
+            seq_len_for_cost=attn_metadata.seq_len_for_cost,
         )
         head_perm = torch.tensor(
             perm_list, device=torch.device("cuda"), dtype=torch.long

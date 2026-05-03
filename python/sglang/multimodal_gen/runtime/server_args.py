@@ -330,6 +330,13 @@ class ServerArgs:
     #   "unequal_asymm" - density-driven LPT, no equal-cap constraint; routed
     #                     via asymm pull/push (torch symm-mem + Triton TMA).
     svg2_load_balance: str = "off"
+    # Optional path to a JSON cost model (mask_fit + attention_fit slopes).
+    # When set and svg2_load_balance != "off", LPT weights heads by
+    #   mask_slope * S + attn_slope * density * S^2
+    # instead of raw density. None falls back to raw density. If the path
+    # does not exist on disk, an auto-profile run on synthetic Q/K/V is
+    # triggered the first time LB plans, then cached at this path.
+    svg2_cost_model_path: str | None = None
 
     # V-MoBA parameters
     moba_config_path: str | None = None
@@ -752,6 +759,15 @@ class ServerArgs:
             "'equal' = density-driven LPT with equal heads/rank + symm a2a. "
             "'unequal_asymm' = density-driven LPT (variable heads/rank) routed via "
             "asymm pull/push over torch symmetric memory.",
+        )
+        parser.add_argument(
+            "--svg2-cost-model-path",
+            type=str,
+            default=ServerArgs.svg2_cost_model_path,
+            help="Optional path to a JSON cost model (mask_fit + attention_fit "
+            "slopes) used as LPT weights for SVG2 load balancing. If the path "
+            "does not exist, an auto-profile on synthetic Q/K/V is run once "
+            "and cached there. Falls back to raw density when unset.",
         )
 
         # Master port for distributed inference
