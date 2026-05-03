@@ -175,6 +175,16 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
     max_seqlen_k: int | None = None
 
 
+def _even_heads_per_rank(num_heads: int, world_size: int) -> list[int]:
+    """Distribute num_heads across world_size as evenly as possible.
+
+    The first `num_heads % world_size` ranks get one extra head. Returned
+    list always sums to num_heads, so it works for non-divisible counts.
+    """
+    base, extra = divmod(num_heads, world_size)
+    return [base + (1 if r < extra else 0) for r in range(world_size)]
+
+
 def _lpt_assignment_unequal(
     densities: list[float],
     world_size: int,
@@ -357,8 +367,7 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
                             uniform = num_heads // world_size.
         """
         if density_cpu is None:
-            equal_hpr = num_heads // world_size
-            return list(range(num_heads)), [equal_hpr] * world_size
+            return list(range(num_heads)), _even_heads_per_rank(num_heads, world_size)
 
         if mode == "unequal_asymm":
             return _lpt_assignment_unequal(
@@ -372,9 +381,16 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         # LPT order
         sorted_heads = sorted(range(num_heads), key=lambda i: (-w[i], i))
 
-        heads_per_rank = (
-            num_heads // world_size
-        )  # guaranteed divisible per your assumption
+        # Equal-cap LPT requires divisibility — the routing layer
+        # (sequence_model_parallel_all_to_all_4D) can't reshape otherwise.
+        # For non-divisible num_heads use --svg2-load-balance unequal_asymm.
+        if num_heads % world_size != 0:
+            raise ValueError(
+                f"--svg2-load-balance equal requires num_heads ({num_heads}) "
+                f"divisible by sp world_size ({world_size}); use unequal_asymm "
+                "for non-divisible head counts."
+            )
+        heads_per_rank = num_heads // world_size
 
         bins: list[list[int]] = [[] for _ in range(world_size)]
         sums = [0.0 for _ in range(world_size)]
@@ -402,10 +418,10 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
             sums[best_r] += w[h]
             sizes[best_r] += 1
 
-        # safety: should always be full
+        # safety: should always be full (equal-cap path requires divisibility,
+        # asserted earlier, so _even_heads_per_rank returns uniform here).
         if sum(sizes) != num_heads:
-            equal_hpr = num_heads // world_size
-            return list(range(num_heads)), [equal_hpr] * world_size
+            return list(range(num_heads)), _even_heads_per_rank(num_heads, world_size)
 
         def makespan() -> float:
             return max(sums)
@@ -512,13 +528,13 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
             head_perm = torch.arange(
                 num_heads, device=torch.device("cuda"), dtype=torch.long
             )
-            equal_hpr = num_heads // world_size
-            heads_per_rank = [equal_hpr] * world_size
+            heads_per_rank = _even_heads_per_rank(num_heads, world_size)
+            ofs = sum(heads_per_rank[:cur_rank])
             layer_cache.head_perm = head_perm
             layer_cache.head_perm_inv = head_perm
             layer_cache.heads_per_rank = heads_per_rank
             layer_cache.h_idxs_r_dev = head_perm[
-                cur_rank * equal_hpr : (cur_rank + 1) * equal_hpr
+                ofs : ofs + heads_per_rank[cur_rank]
             ].to(dtype=torch.int32)
             return head_perm
 
@@ -615,13 +631,14 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
 
         # Per-rank head counts that produced the local density / centroids.
         # heads_per_rank is set by the previous _get_head_reorder_perm call;
-        # if absent (very first density gather) fall back to equal-cap.
+        # if absent (very first density gather) fall back to even split,
+        # which handles non-divisible num_heads.
         if layer_cache.heads_per_rank is not None:
             heads_per_rank = layer_cache.heads_per_rank
             num_heads = sum(heads_per_rank)
         else:
-            num_heads = num_local_heads * world_size
-            heads_per_rank = [num_local_heads] * world_size
+            num_heads = self.num_heads
+            heads_per_rank = _even_heads_per_rank(num_heads, world_size)
         max_hpr = max(heads_per_rank)
 
         if layer_cache.density_async_complete is None:
@@ -1123,15 +1140,16 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         layer_cache = attn_metadata.cache.get_layer(self.layer_idx)
         if layer_cache.h_idxs_r_dev is None:
             num_heads = self.num_heads
-            equal_hpr = num_heads // world_size
+            heads_per_rank = _even_heads_per_rank(num_heads, world_size)
             cur_rank = get_sequence_parallel_rank()
+            ofs = sum(heads_per_rank[:cur_rank])
             layer_cache.h_idxs_r_dev = torch.arange(
-                cur_rank * equal_hpr,
-                (cur_rank + 1) * equal_hpr,
+                ofs,
+                ofs + heads_per_rank[cur_rank],
                 device=q.device,
                 dtype=torch.int32,
             )
-            layer_cache.heads_per_rank = [equal_hpr] * world_size
+            layer_cache.heads_per_rank = heads_per_rank
 
         h_idxs_r = layer_cache.h_idxs_r_dev
         heads_per_rank = layer_cache.heads_per_rank
