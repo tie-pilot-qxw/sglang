@@ -1276,6 +1276,7 @@ class DenoisingStage(PipelineStage):
                 context_length=context_length,
                 prompt_length=prompt_length,
                 cache=cache,
+                load_balance=server_args.svg2_load_balance,
                 calculate_density=False,  # only need density when doing head load balancing
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:

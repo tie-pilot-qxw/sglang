@@ -7,9 +7,8 @@ attention framework.
 Adapted from https://github.com/svg-project/Sparse-VideoGen/blob/main/svg/models/wan/attention.py
 """
 
-import os
 from dataclasses import dataclass, field
-from typing import Any, List
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -90,14 +89,30 @@ class Svg2LayerCache:
     density_async_complete: torch.cuda.Event | None = None
     density_gpu: torch.Tensor | None = None
 
+    # Flat head permutation (length = num_heads). Concatenation of per-rank
+    # head bins under the current LPT placement. Defines the equivalent of
+    # `head_perm[r*hpr:(r+1)*hpr]` for the legacy equal-cap path; for the
+    # unequal LPT path the per-rank slice has length heads_per_rank[r].
     head_perm: torch.Tensor | None = None
     head_perm_inv: torch.Tensor | None = None
+    # Per-rank head counts under the current LPT placement (sum == num_heads).
+    # None until the first density-driven reassignment fires.
+    heads_per_rank: list[int] | None = None
+    # Flat int32 of bins[cur_rank] = global head ids this rank owns. Cached on
+    # device for the asymm pull/push kernels (h_idxs_r). Re-derived whenever
+    # head_perm/heads_per_rank change.
+    h_idxs_r_dev: torch.Tensor | None = None
 
 
 @dataclass
 class Svg2Cache:
     planning_stream: torch.cuda.Stream
     layers: dict[int, Svg2LayerCache] = field(default_factory=dict)
+    # Cached SymmAsymA2A wrapper, keyed by (b, h_total, s_local, d, dtype).
+    # Allocation requires symm.empty + rendezvous (full PG barrier) so we
+    # share one wrapper across all layers / steps with the same shape.
+    symm_a2a: Any = None
+    symm_a2a_key: tuple | None = None
 
     def get_layer(self, layer_idx: int) -> Svg2LayerCache:
         layer_cache = self.layers.get(layer_idx)
@@ -105,6 +120,33 @@ class Svg2Cache:
             layer_cache = Svg2LayerCache()
             self.layers[layer_idx] = layer_cache
         return layer_cache
+
+    def get_or_create_symm_a2a(
+        self,
+        group: "dist.ProcessGroup",
+        b: int,
+        h_total: int,
+        s_local: int,
+        d: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        from sglang.multimodal_gen.runtime.distributed.symm_asym_a2a import SymmAsymA2A
+
+        key = (b, h_total, s_local, d, dtype)
+        if self.symm_a2a is not None and self.symm_a2a_key == key:
+            return self.symm_a2a
+        # Drop the stale wrapper before allocating a new one (frees symm bufs).
+        self.symm_a2a = None
+        self.symm_a2a = SymmAsymA2A(
+            group=group,
+            buffer_shape=(b, h_total, s_local, d),
+            dtype=dtype,
+            device=device,
+            enable_reverse=True,
+        )
+        self.symm_a2a_key = key
+        return self.symm_a2a
 
 
 @dataclass
@@ -123,9 +165,60 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
     num_frame: int
     frame_size: int
     cache: Svg2Cache
+    # SP head load balancing strategy. See ServerArgs.svg2_load_balance.
+    # "off"           - no LB
+    # "equal"         - LPT with equal heads/rank + symm a2a
+    # "unequal_asymm" - LPT (variable heads/rank) + asymm pull/push
+    load_balance: str = "off"
     prompt_length: int | None = None
     max_seqlen_q: int | None = None
     max_seqlen_k: int | None = None
+
+
+def _lpt_assignment_unequal(
+    densities: list[float],
+    world_size: int,
+    min_heads_per_rank: int = 1,
+) -> tuple[list[int], list[int]]:
+    """Pure LPT (no equal-heads constraint), seeded with min_heads_per_rank
+    round-robin assignments so no rank stays empty. Returns
+    (flat_perm, heads_per_rank) where flat_perm is the concatenation of
+    per-rank head bins (each bin sorted ascending) and heads_per_rank gives
+    the per-rank count.
+
+    Adapted from Sparse-VideoGen/scripts/wan/bench_wan_sp_all2all_attention.py
+    `greedy_lpt_assignment`.
+    """
+    n = len(densities)
+    if min_heads_per_rank * world_size > n:
+        raise ValueError(
+            f"min_heads_per_rank={min_heads_per_rank} * world_size={world_size} "
+            f"> n_heads={n}"
+        )
+    loads = [0.0] * world_size
+    bins: list[list[int]] = [[] for _ in range(world_size)]
+    order = sorted(range(n), key=lambda i: -densities[i])
+
+    # Seed: give each rank `min_heads_per_rank` heads round-robin from the top.
+    idx = 0
+    for _ in range(min_heads_per_rank):
+        for r in range(world_size):
+            head = order[idx]
+            bins[r].append(head)
+            loads[r] += densities[head]
+            idx += 1
+
+    # Remaining heads: pure LPT — least-loaded rank wins.
+    for head in order[idx:]:
+        best = min(range(world_size), key=lambda r: loads[r])
+        bins[best].append(head)
+        loads[best] += densities[head]
+
+    for r in range(world_size):
+        bins[r].sort()
+
+    flat = [h for r in range(world_size) for h in bins[r]]
+    return flat, [len(bins[r]) for r in range(world_size)]
 
 
 def _require_kwarg(kwargs: dict[str, Any], name: str) -> Any:
@@ -161,6 +254,7 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
         first_times_fp: float,
         context_length: int = 0,
         prompt_length: int | None = None,
+        load_balance: str = "off",
         **kwargs: dict[str, Any],
     ) -> SparseVideoGen2AttentionMetadata:
         raw_shape = tuple(raw_latent_shape)
@@ -197,6 +291,7 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
             num_frame=num_frame,
             frame_size=frame_size,
             cache=cache,
+            load_balance=load_balance,
         )
 
 
@@ -242,10 +337,34 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         return True
 
     def _compute_head_reorder_perm(
-        self, density_cpu: torch.Tensor | None, num_heads: int, world_size: int
-    ) -> List[int]:
+        self,
+        density_cpu: torch.Tensor | None,
+        num_heads: int,
+        world_size: int,
+        mode: str,
+    ) -> tuple[list[int], list[int]]:
+        """Returns (flat_perm, heads_per_rank).
+
+        flat_perm: permutation of range(num_heads), concatenation of per-rank
+        head bins. Per-rank slice `flat_perm[sum(hpr[:r]) : sum(hpr[:r+1])]`
+        gives rank r's owned global head ids.
+
+        heads_per_rank: list of length world_size with sum == num_heads.
+
+        mode:
+          "unequal_asymm" - unequal LPT (variable heads_per_rank).
+          "equal" / other - equal-cap LPT + local search; heads_per_rank
+                            uniform = num_heads // world_size.
+        """
         if density_cpu is None:
-            return list(range(num_heads))
+            equal_hpr = num_heads // world_size
+            return list(range(num_heads)), [equal_hpr] * world_size
+
+        if mode == "unequal_asymm":
+            return _lpt_assignment_unequal(
+                [float(density_cpu[i].item()) for i in range(num_heads)],
+                world_size,
+            )
 
         # weight: higher density => more work
         w = [float(density_cpu[i].item()) for i in range(num_heads)]
@@ -285,7 +404,8 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
 
         # safety: should always be full
         if sum(sizes) != num_heads:
-            return list(range(num_heads))
+            equal_hpr = num_heads // world_size
+            return list(range(num_heads)), [equal_hpr] * world_size
 
         def makespan() -> float:
             return max(sums)
@@ -378,27 +498,35 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         for r in range(world_size):
             bins[r].sort()
 
-        return [h for r in range(world_size) for h in bins[r]]
+        flat = [h for r in range(world_size) for h in bins[r]]
+        return flat, [len(bins[r]) for r in range(world_size)]
 
     def _get_head_reorder_perm(
         self, attn_metadata: SparseVideoGen2AttentionMetadata, world_size: int
     ) -> torch.Tensor:
         layer_cache = attn_metadata.cache.get_layer(self.layer_idx)
         num_heads = self.num_heads
+        cur_rank = get_sequence_parallel_rank()
 
         if layer_cache.density_async_complete is None:
             head_perm = torch.arange(
                 num_heads, device=torch.device("cuda"), dtype=torch.long
             )
+            equal_hpr = num_heads // world_size
+            heads_per_rank = [equal_hpr] * world_size
             layer_cache.head_perm = head_perm
             layer_cache.head_perm_inv = head_perm
+            layer_cache.heads_per_rank = heads_per_rank
+            layer_cache.h_idxs_r_dev = head_perm[
+                cur_rank * equal_hpr : (cur_rank + 1) * equal_hpr
+            ].to(dtype=torch.int32)
             return head_perm
 
         torch.cuda.current_stream().wait_event(layer_cache.density_async_complete)
         assert layer_cache.density is not None
 
-        perm_list = self._compute_head_reorder_perm(
-            layer_cache.density, num_heads, world_size
+        perm_list, heads_per_rank = self._compute_head_reorder_perm(
+            layer_cache.density, num_heads, world_size, attn_metadata.load_balance
         )
         head_perm = torch.tensor(
             perm_list, device=torch.device("cuda"), dtype=torch.long
@@ -407,16 +535,19 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         head_perm_inv[head_perm] = torch.arange(num_heads, device=head_perm.device)
         layer_cache.head_perm = head_perm
         layer_cache.head_perm_inv = head_perm_inv
+        layer_cache.heads_per_rank = heads_per_rank
+
+        # This rank's owned global head ids = bins[cur_rank]. With unequal LPT
+        # the per-rank slice has variable length; fall back to equal cumsum
+        # under the symm path where heads_per_rank is uniform.
+        ofs = sum(heads_per_rank[:cur_rank])
+        head_ids = head_perm[ofs : ofs + heads_per_rank[cur_rank]]
+        layer_cache.h_idxs_r_dev = head_ids.to(dtype=torch.int32)
 
         if (
             layer_cache.q_centroids_global is not None
             and layer_cache.k_centroids_global is not None
         ):
-            num_local_heads = num_heads // world_size
-            cur_rank = get_sequence_parallel_rank()
-            head_ids = head_perm[
-                cur_rank * num_local_heads : (cur_rank + 1) * num_local_heads
-            ]
             q_clusters = layer_cache.q_centroids_global.size(1)
             q_dim = layer_cache.q_centroids_global.size(2)
             k_clusters = layer_cache.k_centroids_global.size(1)
@@ -481,7 +612,17 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
             return
 
         num_local_heads = local_density.numel()
-        num_heads = num_local_heads * world_size
+
+        # Per-rank head counts that produced the local density / centroids.
+        # heads_per_rank is set by the previous _get_head_reorder_perm call;
+        # if absent (very first density gather) fall back to equal-cap.
+        if layer_cache.heads_per_rank is not None:
+            heads_per_rank = layer_cache.heads_per_rank
+            num_heads = sum(heads_per_rank)
+        else:
+            num_heads = num_local_heads * world_size
+            heads_per_rank = [num_local_heads] * world_size
+        max_hpr = max(heads_per_rank)
 
         if layer_cache.density_async_complete is None:
             layer_cache.density_async_complete = torch.cuda.Event()
@@ -494,17 +635,32 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         planning_stream.wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(planning_stream):
-            if layer_cache.head_perm_inv is not None:
-                inv_old_perm = layer_cache.head_perm_inv
+            # Build pos_of_head[gh] = r * max_hpr + lh: the position of global
+            # head gh in the gathered+padded `[world_size * max_hpr, ...]` tensor.
+            # In the equal-cap case (heads_per_rank uniform == num_local_heads,
+            # max_hpr == num_local_heads, no padding) this reduces to the legacy
+            # head_perm_inv. With unequal LPT the padded slots are never read
+            # because pos_of_head only maps real heads.
+            if layer_cache.head_perm is not None:
+                head_perm_cpu = layer_cache.head_perm.tolist()
             else:
-                inv_old_perm = torch.arange(
-                    num_heads, device=local_density.device, dtype=torch.long
-                )
+                head_perm_cpu = list(range(num_heads))
+            pos_of_head_list = [0] * num_heads
+            ofs = 0
+            for r in range(world_size):
+                hpr = heads_per_rank[r]
+                for lh in range(hpr):
+                    gh = head_perm_cpu[ofs + lh]
+                    pos_of_head_list[gh] = r * max_hpr + lh
+                ofs += hpr
+            pos_of_head = torch.tensor(
+                pos_of_head_list, device=local_density.device, dtype=torch.long
+            )
 
             _, num_q_centroids, q_dim = layer_cache.q_centroids.size()
             _, num_k_centroids, k_dim = layer_cache.k_centroids.size()
 
-            # reshape to [B, H, C, D]
+            # reshape to [B, H_local_r, C, D]
             q_centroids = layer_cache.q_centroids.reshape(
                 -1,
                 num_local_heads,
@@ -520,42 +676,66 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
 
             sp_group = get_sp_group().device_group
 
-            # gather density in old-perm order, then reorder to global head ids
+            # Pad local tensors to max_hpr along H so all_gather_into_tensor
+            # (which requires uniform per-rank shape) works under variable LPT.
+            def _pad_h(t: torch.Tensor, h_dim: int) -> torch.Tensor:
+                pad_n = max_hpr - t.size(h_dim)
+                if pad_n == 0:
+                    return t.contiguous()
+                pad_shape = list(t.shape)
+                pad_shape[h_dim] = pad_n
+                pad = t.new_zeros(pad_shape)
+                return torch.cat([t, pad], dim=h_dim).contiguous()
+
+            if num_local_heads < max_hpr:
+                local_density_padded = torch.cat(
+                    [local_density, local_density.new_zeros(max_hpr - num_local_heads)]
+                ).contiguous()
+            else:
+                local_density_padded = local_density.contiguous()
+
+            q_centroids_padded = _pad_h(q_centroids, 1)
+            k_centroids_padded = _pad_h(k_centroids, 1)
+
+            # gather density in (rank, padded local head) order, then index
+            # back to global head id.
             density_gather = torch.empty(
-                (world_size,) + local_density.shape,
+                (world_size, max_hpr),
                 device=local_density.device,
                 dtype=local_density.dtype,
             )
-            dist.all_gather_into_tensor(density_gather, local_density, group=sp_group)
-            density_all = density_gather.reshape(num_heads)
-            layer_cache.density_gpu = density_all.index_select(0, inv_old_perm)
+            dist.all_gather_into_tensor(
+                density_gather, local_density_padded, group=sp_group
+            )
+            density_all = density_gather.reshape(world_size * max_hpr)
+            layer_cache.density_gpu = density_all.index_select(0, pos_of_head)
 
-            # gather centroids in old-perm order, then reorder to global head ids
+            # gather centroids and reorder to global head ids
             q_gather = torch.empty(
-                (world_size,) + q_centroids.shape,
-                device=q_centroids.device,
-                dtype=q_centroids.dtype,
+                (world_size,) + q_centroids_padded.shape,
+                device=q_centroids_padded.device,
+                dtype=q_centroids_padded.dtype,
             )
-            dist.all_gather_into_tensor(q_gather, q_centroids, group=sp_group)
+            dist.all_gather_into_tensor(q_gather, q_centroids_padded, group=sp_group)
             q_all = q_gather.permute(1, 0, 2, 3, 4).reshape(
-                -1, num_heads, num_q_centroids, q_dim
+                -1, world_size * max_hpr, num_q_centroids, q_dim
             )
-            layer_cache.q_centroids_global = q_all.index_select(
-                1, inv_old_perm
-            ).reshape(-1, num_q_centroids, q_dim)
+            layer_cache.q_centroids_global = q_all.index_select(1, pos_of_head).reshape(
+                -1, num_q_centroids, q_dim
+            )
 
             k_gather = torch.empty(
-                (world_size,) + k_centroids.shape,
-                device=k_centroids.device,
-                dtype=k_centroids.dtype,
+                (world_size,) + k_centroids_padded.shape,
+                device=k_centroids_padded.device,
+                dtype=k_centroids_padded.dtype,
             )
-            dist.all_gather_into_tensor(k_gather, k_centroids, group=sp_group)
+            dist.all_gather_into_tensor(k_gather, k_centroids_padded, group=sp_group)
             k_all = k_gather.permute(1, 0, 2, 3, 4).reshape(
-                -1, num_heads, num_k_centroids, k_dim
+                -1, world_size * max_hpr, num_k_centroids, k_dim
             )
-            layer_cache.k_centroids_global = k_all.index_select(
-                1, inv_old_perm
-            ).reshape(-1, num_k_centroids, k_dim)
+            layer_cache.k_centroids_global = k_all.index_select(1, pos_of_head).reshape(
+                -1, num_k_centroids, k_dim
+            )
 
             # copy back to cpu
             layer_cache.density.copy_(layer_cache.density_gpu, non_blocking=True)
@@ -893,11 +1073,11 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
                 output_permuted, q_sorted_indices, dim=2
             )
 
-            enable_loadbalance = os.getenv(
-                "SGLANG_SVG2_LOADBALANCE", "1"
-            ).lower() not in ("0", "false")
-            # if multiple cards, collect density
-            if get_sequence_parallel_world_size() > 1 and enable_loadbalance:
+            # Density gather only matters when LB will use it next step.
+            if (
+                get_sequence_parallel_world_size() > 1
+                and attn_metadata.load_balance != "off"
+            ):
                 densities = density_calculation(
                     dyn_map, qc_sz_s, kc_sz_s
                 )  # [batch_size, num_heads]
@@ -912,3 +1092,119 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
             backend="default"
         )  # reset to default
         return res.contiguous()
+
+    def forward_distributed_asymm(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_metadata: SparseVideoGen2AttentionMetadata,
+    ) -> torch.Tensor:
+        """Asymm a2a path: variable heads-per-rank LPT + symm-mem pull/push.
+
+        Replaces the symm path's
+            preprocess → all_to_all(scatter=2,gather=1) × 3
+            → forward → all_to_all(scatter=1,gather=2) → postprocess
+        with
+            head-LPT (variable hpr) → write to symm bufs → pull → forward
+            → push → trim
+        and skips the pre/post head permute (the kernel routes by h_idxs_r).
+
+        Inputs are [B, S_local, H_total, D]; output matches.
+        """
+        world_size = get_sequence_parallel_world_size()
+        if world_size == 1:
+            return self.forward(q, k, v, attn_metadata)
+
+        # 1. Plan: which heads does this rank own this step? Falls back to
+        # contiguous when sparse window not active OR when no density yet.
+        if self._use_sparse_attention(attn_metadata):
+            self._get_head_reorder_perm(attn_metadata, world_size)
+        layer_cache = attn_metadata.cache.get_layer(self.layer_idx)
+        if layer_cache.h_idxs_r_dev is None:
+            num_heads = self.num_heads
+            equal_hpr = num_heads // world_size
+            cur_rank = get_sequence_parallel_rank()
+            layer_cache.h_idxs_r_dev = torch.arange(
+                cur_rank * equal_hpr,
+                (cur_rank + 1) * equal_hpr,
+                device=q.device,
+                dtype=torch.int32,
+            )
+            layer_cache.heads_per_rank = [equal_hpr] * world_size
+
+        h_idxs_r = layer_cache.h_idxs_r_dev
+        heads_per_rank = layer_cache.heads_per_rank
+
+        # 2. Allocate / fetch symm wrapper. Shape uses S_local from input.
+        b, s_local, h_total, d = q.shape
+        sp_group = get_sp_group().device_group
+        symm_a2a = attn_metadata.cache.get_or_create_symm_a2a(
+            sp_group, b, h_total, s_local, d, q.dtype, q.device
+        )
+
+        # 3. Write q/k/v into symm buffers in original head order
+        # ([B, S_local, H, D] -> [B, H, S_local, D]).
+        real_s = symm_a2a.s_local
+        symm_a2a.q_symm[:, :, :real_s, :].copy_(q.transpose(1, 2).contiguous())
+        symm_a2a.k_symm[:, :, :real_s, :].copy_(k.transpose(1, 2).contiguous())
+        symm_a2a.v_symm[:, :, :real_s, :].copy_(v.transpose(1, 2).contiguous())
+
+        # 4. Pull: each rank gathers its assigned heads × full seq.
+        # Returns [B, H_local_r, WORLD * S_local_padded, D].
+        q_loc = symm_a2a.pull_seq_to_heads(
+            "q", h_idxs_r, pre_barrier=True, post_barrier=True
+        )
+        k_loc = symm_a2a.pull_seq_to_heads(
+            "k", h_idxs_r, pre_barrier=False, post_barrier=False
+        )
+        v_loc = symm_a2a.pull_seq_to_heads(
+            "v", h_idxs_r, pre_barrier=False, post_barrier=True
+        )
+
+        # Trim padded S back to real S_total = world_size * s_local.
+        s_total = world_size * s_local
+        if s_total != q_loc.size(2):
+            q_loc = q_loc[:, :, :s_total, :].contiguous()
+            k_loc = k_loc[:, :, :s_total, :].contiguous()
+            v_loc = v_loc[:, :, :s_total, :].contiguous()
+
+        # 5. Hand to attn_impl in [B, S, H, D] layout.
+        q_loc = q_loc.transpose(1, 2).contiguous()
+        k_loc = k_loc.transpose(1, 2).contiguous()
+        v_loc = v_loc.transpose(1, 2).contiguous()
+        out_loc = self.forward(q_loc, k_loc, v_loc, attn_metadata)
+        # out_loc: [B, S_total, H_local_r, D]
+
+        # 6. Push back: [B, H_local_r, S_total_padded, D] -> peers' recv_symm.
+        out_h_first = out_loc.transpose(1, 2).contiguous()  # [B, H_local_r, S_total, D]
+        s_padded_total = world_size * symm_a2a.s_local_padded
+        if out_h_first.size(2) != s_padded_total:
+            # Pad each per-peer S segment from s_local to s_local_padded so the
+            # push kernel reads its expected stride. Per-peer slabs sit at
+            # [p * s_local_padded : p * s_local_padded + s_local].
+            pad_s = symm_a2a.s_local_padded - symm_a2a.s_local
+            if pad_s > 0:
+                h_local = out_h_first.size(1)
+                src_padded = out_h_first.new_zeros(
+                    b, h_local, world_size * symm_a2a.s_local_padded, d
+                )
+                for p in range(world_size):
+                    src_padded[
+                        :,
+                        :,
+                        p * symm_a2a.s_local_padded : p * symm_a2a.s_local_padded
+                        + symm_a2a.s_local,
+                        :,
+                    ] = out_h_first[
+                        :, :, p * symm_a2a.s_local : (p + 1) * symm_a2a.s_local, :
+                    ]
+                out_h_first = src_padded
+        out_full = symm_a2a.push_heads_to_seq(
+            out_h_first, h_idxs_r, pre_barrier=True, post_barrier=True
+        )
+        # out_full: [B, H_total, s_local_padded, D]; trim to s_local then bshd.
+        if symm_a2a.s_local_padded != real_s:
+            out_full = out_full[:, :, :real_s, :].contiguous()
+        out = out_full.transpose(1, 2).contiguous()  # [B, S_local, H_total, D]
+        return out

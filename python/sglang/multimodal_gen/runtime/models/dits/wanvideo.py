@@ -176,7 +176,7 @@ def _wan_force_profile_start() -> torch.profiler.profile:
     return _WAN_FORCE_PROFILER
 
 
-def _wan_maybe_merge_traces(trace_path: str, step_idx: int, lb_tag: str) -> None:
+def _wan_maybe_merge_traces(trace_path: str, step_idx: int) -> None:
     if not (dist.is_available() and dist.is_initialized()):
         return
     world_size = dist.get_world_size()
@@ -223,14 +223,14 @@ def _wan_maybe_merge_traces(trace_path: str, step_idx: int, lb_tag: str) -> None
     base_trace["traceEvents"] = merged_events
     out_path = os.path.join(
         _WAN_FORCE_PROFILE_DIR,
-        f"wan2.force.merged.s{step_idx}.{lb_tag}.trace.json",
+        f"wan2.force.merged.s{step_idx}.trace.json",
     )
     with open(out_path, "w") as f:
         json.dump(base_trace, f)
     logger.info("Wan2 force profiler merged: step=%s path=%s", step_idx, out_path)
 
 
-def _wan_force_profile_stop(timestep: int, rank: int, lb_tag: str) -> None:
+def _wan_force_profile_stop(timestep: int, rank: int) -> None:
     global _WAN_FORCE_PROFILER
     if _WAN_FORCE_PROFILER is None:
         return
@@ -250,7 +250,7 @@ def _wan_force_profile_stop(timestep: int, rank: int, lb_tag: str) -> None:
         timestep,
         trace_path,
     )
-    _wan_maybe_merge_traces(trace_path, timestep, lb_tag)
+    _wan_maybe_merge_traces(trace_path, timestep)
     _WAN_FORCE_PROFILER = None
 
 
@@ -1127,12 +1127,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
-            lb_tag = (
-                "lb1"
-                if os.getenv("SGLANG_SVG2_LOADBALANCE", "1").lower()
-                not in ("0", "false")
-                else "lb0"
-            )
             for block_idx, block in enumerate(self.blocks):
                 if (
                     force_profile
@@ -1143,7 +1137,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 enabled = _wan_should_profile(profile_step, block_idx)
                 with _profile_scope(
                     enabled,
-                    f"wan2.block.r{profile_rank}.s{profile_step}.l{block_idx}.{lb_tag}",
+                    f"wan2.block.r{profile_rank}.s{profile_step}.l{block_idx}",
                 ):
                     hidden_states = block(
                         hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
@@ -1153,7 +1147,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     and _WAN_FORCE_PROFILE_LAYER is not None
                     and block_idx == _WAN_FORCE_PROFILE_LAYER
                 ):
-                    _wan_force_profile_stop(profile_step, profile_rank, lb_tag)
+                    _wan_force_profile_stop(profile_step, profile_rank)
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)

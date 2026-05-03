@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import os
 from typing import Type
 
 import torch
@@ -428,9 +427,6 @@ class LoadBalancingUlyssesAttention(USPAttention):
             raise ValueError(
                 "LoadBalancingUlyssesAttention does not support ring parallelism."
             )
-        self.enable_loadbalancing = os.getenv(
-            "SGLANG_SVG2_LOADBALANCE", "1"
-        ).lower() not in ("0", "false")
 
     def forward(
         self,
@@ -453,9 +449,23 @@ class LoadBalancingUlyssesAttention(USPAttention):
         if get_sequence_parallel_world_size() == 1:
             return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
+        # Cross-attn (q ≠ k/v shape) always falls back to the plain symm path
+        # — head LB only makes sense for self-attn where Q/K/V share H/S.
+        lb_mode = getattr(ctx_attn_metadata, "load_balance", "off")
+        if not (q.shape == k.shape == v.shape):
+            lb_mode = "off"
+
         if get_ulysses_parallel_world_size() > 1:
+            if lb_mode == "unequal_asymm":
+                # Asymm path: planning + all_to_all comm + inverse mapping all
+                # routed by h_idxs_r-indexed pull/push. Skips symm a2a and the
+                # pre/post head permute entirely.
+                return self.attn_impl.forward_distributed_asymm(
+                    q, k, v, ctx_attn_metadata
+                )
+
             did_reorder = False
-            if self.enable_loadbalancing and q.shape == k.shape == v.shape:
+            if lb_mode == "equal":
                 q, k, v = self.attn_impl.preprocess_qkv_before_all_to_all(
                     q, k, v, ctx_attn_metadata
                 )

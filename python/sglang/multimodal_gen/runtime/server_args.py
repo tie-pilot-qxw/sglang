@@ -323,6 +323,13 @@ class ServerArgs:
     svg2_zero_step_kmeans_init: bool = False
     svg2_first_layers_fp: float = 0.03
     svg2_first_times_fp: float = 0.2
+    # SP head load balancing for SVG2:
+    #   "off"           - no LB (contiguous head split, plain symm a2a).
+    #   "equal"         - density-driven LPT with equal heads/rank cap + local
+    #                     search; routed via symm a2a.
+    #   "unequal_asymm" - density-driven LPT, no equal-cap constraint; routed
+    #                     via asymm pull/push (torch symm-mem + Triton TMA).
+    svg2_load_balance: str = "off"
 
     # V-MoBA parameters
     moba_config_path: str | None = None
@@ -735,6 +742,16 @@ class ServerArgs:
             type=float,
             default=ServerArgs.svg2_first_times_fp,
             help="Fraction (0-1) or absolute timestep threshold for full attention in Sparse Video Gen 2 (SAP).",
+        )
+        parser.add_argument(
+            "--svg2-load-balance",
+            choices=["off", "equal", "unequal_asymm"],
+            default=ServerArgs.svg2_load_balance,
+            help="SP head load balancing strategy for SVG2. "
+            "'off' = contiguous head split + plain symm a2a (baseline). "
+            "'equal' = density-driven LPT with equal heads/rank + symm a2a. "
+            "'unequal_asymm' = density-driven LPT (variable heads/rank) routed via "
+            "asymm pull/push over torch symmetric memory.",
         )
 
         # Master port for distributed inference
